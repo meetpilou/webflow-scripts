@@ -1,228 +1,240 @@
 /**
- * Grid Overlay — MAST-compatible JS
+ * Animated Grid Overlay — MAST-compatible JS
  *
- * Column overlay that can be toggled on/off as a layout reference. Columns
- * slide in from below and exit upward, staggered from the center outward.
- * The open/closed state is persisted between sessions.
+ * Toggleable column overlay used as a layout/debug grid. Columns slide up from
+ * below when opened and slide out above when closed, with a staggered motion.
+ * State persists across reloads via localStorage.
  *
  * Data attributes consumed:
- *   [data-grid-overlay]                       — Root element (required)
- *   [data-grid-overlay-column]                — Column, repeatable (required)
- *   [data-grid-overlay-toggle]                — Trigger element, repeatable (optional)
- *   [data-grid-overlay-shortcut="g"]          — Shortcut letter used with Shift (default "g")
- *   [data-grid-overlay-start-open="true"]     — Default to open when no stored state
- *   [data-grid-overlay-persist="false"]       — Disable localStorage persistence
+ *   [data-animated-grid]                 — Root overlay element (required)
+ *   [data-animated-grid-col]             — Individual column element (required, repeatable)
+ *   [data-animated-grid-toggle]          — Button/element that toggles the overlay (optional, repeatable)
+ *   [data-animated-grid-shortcut="g"]    — Keyboard shortcut letter, used with Shift (optional, default "g")
+ *   [data-animated-grid-start-open="true"] — Force the grid open on first load (optional)
  *
- * Dependencies: GSAP (optional — the script falls back to CSS transitions)
+ * Dependencies: GSAP (optional — falls back to CSS transitions when absent)
  */
+
 (function () {
   "use strict";
 
-  const root = document.querySelector("[data-grid-overlay]");
-  if (!root) {
+  // Early exit if the overlay is not on the page
+  const grid = document.querySelector("[data-animated-grid]");
+  if (!grid) {
     return;
   }
 
-  const DURATION = 1;
-  const STAGGER = 0.03;
-  const EASE_CSS = "cubic-bezier(.165, .84, .44, 1)";
-  const EASE_GSAP = "power4.out";
-  const STORAGE_KEY = "grid-overlay-state";
+  const STORAGE_KEY = "animated-grid-state";
 
-  function init() {
-    const columns = Array.from(root.querySelectorAll("[data-grid-overlay-column]"));
-    if (!columns.length) {
+  function initAnimatedGrid() {
+    const cols = grid.querySelectorAll("[data-animated-grid-col]");
+    const toggles = document.querySelectorAll("[data-animated-grid-toggle]");
+
+    if (!cols.length) {
       return;
     }
 
-    const toggles = Array.from(document.querySelectorAll("[data-grid-overlay-toggle]"));
+    // Per-index delays for the CSS fallback, staggered from the center outward
+    // so it matches GSAP's `stagger.from: "center"`.
+    const mid = (cols.length - 1) / 2;
+    const staggerDelays = Array.from(cols, (_, i) => Math.abs(i - mid) * 0.03);
 
-    const persistEnabled = root.getAttribute("data-grid-overlay-persist") !== "false";
-    const shortcutAttr = root.getAttribute("data-grid-overlay-shortcut");
-    const shortcutKey = shortcutAttr && shortcutAttr.length === 1
+    // Reduced motion preference
+    let prefersReducedMotion = false;
+    try {
+      const reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+      prefersReducedMotion = reducedMotionQuery.matches;
+      reducedMotionQuery.addEventListener("change", (e) => {
+        prefersReducedMotion = e.matches;
+      });
+    } catch (e) {
+      prefersReducedMotion = false;
+    }
+
+    // Resolve initial state: stored value wins, otherwise fall back to the
+    // data-animated-grid-start-open flag, otherwise closed.
+    const startOpen = grid.getAttribute("data-animated-grid-start-open") === "true";
+    let isOpen = startOpen;
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (stored === "open") {
+        isOpen = true;
+      } else if (stored === "closed") {
+        isOpen = false;
+      }
+    } catch (e) {
+      // localStorage unavailable (privacy mode, quota) — fall back to start attr
+    }
+
+    // Resolve keyboard shortcut letter
+    const shortcutAttr = grid.getAttribute("data-animated-grid-shortcut");
+    const shortcutKey = (shortcutAttr && shortcutAttr.length === 1)
       ? shortcutAttr.toLowerCase()
       : "g";
 
-    // Stagger delays — computed once from the center outward so closures below
-    // don't redo the math on every toggle.
-    const staggerDelays = buildCenterOutDelays(columns.length, STAGGER);
-
-    // Reduced motion — read once, update live
-    let reducedMotion = false;
-    try {
-      const mql = window.matchMedia("(prefers-reduced-motion: reduce)");
-      reducedMotion = mql.matches;
-      mql.addEventListener("change", (ev) => {
-        reducedMotion = ev.matches;
+    // Apply initial position without animation
+    if (typeof gsap !== "undefined") {
+      gsap.set(grid, { display: "block" });
+      gsap.set(cols, { yPercent: isOpen ? 0 : 100 });
+    } else {
+      grid.style.display = "block";
+      cols.forEach((col) => {
+        col.style.transform = `translateY(${isOpen ? 0 : 100}%)`;
       });
-    } catch (e) {
-      reducedMotion = false;
     }
 
-    const hasGSAP = typeof gsap !== "undefined";
+    // Apply initial ARIA state
+    grid.setAttribute("aria-hidden", isOpen ? "false" : "true");
+    updateTogglesState();
 
-    // Initial state resolution
-    let opened = resolveInitialState();
-    paint(opened ? 0 : 100, /* animated */ false);
-    root.setAttribute("aria-hidden", opened ? "false" : "true");
-    syncToggles();
-
-    // Wire up interactions
-    toggles.forEach((toggle) => {
-      toggle.addEventListener("click", onToggleClick);
-    });
-    document.addEventListener("keydown", onKeydown);
-
-    // ——— State ——————————————————————————————————————————————
-
-    function resolveInitialState() {
-      if (persistEnabled) {
-        try {
-          const stored = localStorage.getItem(STORAGE_KEY);
-          if (stored === "open") return true;
-          if (stored === "closed") return false;
-        } catch (e) {
-          // Storage blocked — fall through to the default flag
-        }
-      }
-      return root.getAttribute("data-grid-overlay-start-open") === "true";
-    }
-
-    function saveState() {
-      if (!persistEnabled) return;
+    function persistState() {
       try {
-        localStorage.setItem(STORAGE_KEY, opened ? "open" : "closed");
+        localStorage.setItem(STORAGE_KEY, isOpen ? "open" : "closed");
       } catch (e) {
-        // Storage blocked — current session still behaves correctly
+        // Silently ignore — overlay still works for the current session
       }
     }
 
-    function syncToggles() {
-      const label = opened ? "Hide layout grid" : "Show layout grid";
+    function updateTogglesState() {
       toggles.forEach((toggle) => {
-        toggle.setAttribute("aria-pressed", opened ? "true" : "false");
-        toggle.setAttribute("aria-label", label);
+        toggle.setAttribute("aria-pressed", isOpen ? "true" : "false");
+        toggle.setAttribute(
+          "aria-label",
+          isOpen ? "Hide layout grid" : "Show layout grid"
+        );
       });
     }
 
-    // ——— Painting / animation —————————————————————————————————
+    function openGrid() {
+      isOpen = true;
+      persistState();
+      grid.setAttribute("aria-hidden", "false");
+      updateTogglesState();
 
-    // Place columns at a given yPercent. When `animated` is true, columns
-    // transition from their current position to the target; when false, the
-    // position is set instantly. `fromPercent` is only relevant for the
-    // animated path because GSAP / CSS transitions need a known start.
-    function paint(toPercent, animated, fromPercent) {
-      if (!animated || reducedMotion) {
-        if (hasGSAP) {
-          gsap.set(root, { display: "block" });
-          gsap.set(columns, { yPercent: toPercent });
+      if (prefersReducedMotion) {
+        if (typeof gsap !== "undefined") {
+          gsap.set(cols, { yPercent: 0 });
         } else {
-          root.style.display = "block";
-          columns.forEach((col) => {
+          cols.forEach((col) => {
             col.style.transition = "";
-            col.style.willChange = "";
-            col.style.transform = `translateY(${toPercent}%)`;
+            col.style.transform = "translateY(0%)";
           });
         }
         return;
       }
 
-      if (hasGSAP) {
-        gsap.set(root, { display: "block" });
+      if (typeof gsap !== "undefined") {
         gsap.fromTo(
-          columns,
-          { yPercent: fromPercent },
+          cols,
+          { yPercent: 100 },
           {
-            yPercent: toPercent,
-            duration: DURATION,
-            ease: EASE_GSAP,
-            stagger: { each: STAGGER, from: "center" },
+            yPercent: 0,
+            duration: 1,
+            ease: "power4.out",
+            stagger: { each: 0.03, from: "center" },
             overwrite: true,
           }
         );
+      } else {
+        cols.forEach((col, i) => {
+          col.style.transition = "none";
+          col.style.transform = "translateY(100%)";
+          // Force reflow so the starting position is committed
+          void col.offsetHeight;
+          col.style.transition = `transform 1s cubic-bezier(.165, .84, .44, 1) ${staggerDelays[i]}s`;
+          col.style.transform = "translateY(0%)";
+        });
+      }
+    }
+
+    function closeGrid() {
+      isOpen = false;
+      persistState();
+      grid.setAttribute("aria-hidden", "true");
+      updateTogglesState();
+
+      if (prefersReducedMotion) {
+        if (typeof gsap !== "undefined") {
+          gsap.set(cols, { yPercent: -100 });
+        } else {
+          cols.forEach((col) => {
+            col.style.transition = "";
+            col.style.transform = "translateY(-100%)";
+          });
+        }
         return;
       }
 
-      // CSS fallback — mirror the GSAP behavior as closely as possible.
-      root.style.display = "block";
-      columns.forEach((col, i) => {
-        // Prime the starting position without a transition
-        col.style.transition = "none";
-        col.style.willChange = "transform";
-        col.style.transform = `translateY(${fromPercent}%)`;
-      });
-
-      // Commit the starting position before we arm the transition
-      void root.offsetHeight;
-
-      columns.forEach((col, i) => {
-        col.style.transition = `transform ${DURATION}s ${EASE_CSS} ${staggerDelays[i]}s`;
-        col.style.transform = `translateY(${toPercent}%)`;
-      });
-
-      // Clear will-change after the longest animation completes
-      const maxDelay = Math.max.apply(null, staggerDelays);
-      const totalMs = (DURATION + maxDelay) * 1000 + 50;
-      setTimeout(() => {
-        columns.forEach((col) => {
-          col.style.willChange = "";
+      if (typeof gsap !== "undefined") {
+        gsap.fromTo(
+          cols,
+          { yPercent: 0 },
+          {
+            yPercent: -100,
+            duration: 1,
+            ease: "power4.out",
+            stagger: { each: 0.03, from: "center" },
+            overwrite: true,
+          }
+        );
+      } else {
+        cols.forEach((col, i) => {
+          col.style.transition = `transform 1s cubic-bezier(.165, .84, .44, 1) ${staggerDelays[i]}s`;
+          col.style.transform = "translateY(-100%)";
         });
-      }, totalMs);
+      }
     }
 
-    function setOpened(next) {
-      if (opened === next) return;
-      opened = next;
-
-      const from = next ? 100 : 0;
-      const to = next ? 0 : -100;
-
-      saveState();
-      root.setAttribute("aria-hidden", next ? "false" : "true");
-      syncToggles();
-      paint(to, true, from);
+    function toggleGrid() {
+      if (isOpen) {
+        closeGrid();
+      } else {
+        openGrid();
+      }
     }
 
-    // ——— Event handlers ——————————————————————————————————————
-
-    function onToggleClick(ev) {
-      ev.preventDefault();
-      setOpened(!opened);
+    function isTypingContext(e) {
+      const el = e.target;
+      if (!el) {
+        return false;
+      }
+      const tag = (el.tagName || "").toLowerCase();
+      return (
+        tag === "input" ||
+        tag === "textarea" ||
+        tag === "select" ||
+        el.isContentEditable
+      );
     }
 
-    function onKeydown(ev) {
-      if (!ev.shiftKey) return;
-      if (isTypingContext(ev.target)) return;
-      if ((ev.key || "").toLowerCase() !== shortcutKey) return;
+    // Wire up toggle buttons
+    toggles.forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        toggleGrid();
+      });
+    });
 
-      ev.preventDefault();
-      setOpened(!opened);
-    }
+    // Wire up keyboard shortcut (Shift + configured letter)
+    window.addEventListener("keydown", (e) => {
+      if (isTypingContext(e)) {
+        return;
+      }
+      if (!e.shiftKey) {
+        return;
+      }
+      if ((e.key || "").toLowerCase() !== shortcutKey) {
+        return;
+      }
+      e.preventDefault();
+      toggleGrid();
+    });
   }
 
-  // ——— Pure helpers ————————————————————————————————————————
-
-  // Build per-index delays so the middle column(s) start first and the edges
-  // start last. Matches GSAP's `stagger.from: "center"`.
-  function buildCenterOutDelays(count, each) {
-    const mid = (count - 1) / 2;
-    const delays = new Array(count);
-    for (let i = 0; i < count; i++) {
-      delays[i] = Math.abs(i - mid) * each;
-    }
-    return delays;
-  }
-
-  function isTypingContext(el) {
-    if (!el) return false;
-    const tag = (el.tagName || "").toLowerCase();
-    if (tag === "input" || tag === "textarea" || tag === "select") return true;
-    return !!el.isContentEditable;
-  }
-
+  // Initialize on DOM ready
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
+    document.addEventListener("DOMContentLoaded", initAnimatedGrid);
   } else {
-    init();
+    initAnimatedGrid();
   }
 })();
